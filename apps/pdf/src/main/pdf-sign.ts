@@ -1,7 +1,16 @@
 import { X509Certificate } from 'node:crypto'
 import { deflateSync } from 'node:zlib'
 import forge from 'node-forge'
-import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFRef, PDFString } from 'pdf-lib'
+import {
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFRef,
+  PDFString,
+} from 'pdf-lib'
 import type { PDFObject } from 'pdf-lib'
 import type {
   CertificateErrorCode,
@@ -426,14 +435,42 @@ async function assemble(
     const radians = (rotation * Math.PI) / 180
     const cos = Math.round(Math.cos(radians))
     const sin = Math.round(Math.sin(radians))
-    const stream = context.stream(`q ${placed.w} 0 0 ${placed.h} 0 0 cm /Sig0 Do Q`, {
-      Type: 'XObject',
-      Subtype: 'Form',
-      BBox: [0, 0, placed.w, placed.h],
-      Matrix: [cos, sin, -sin, cos, 0, 0],
-      Resources: { XObject: { Sig0: image.ref } },
-    })
-    appearanceRef = context.register(stream)
+    // Acrobat rejects the signature ("Expected a dict object") when the appearance form paints
+    // an image XObject directly, so mirror its own layout: N -> FRM -> n0 (blank) + n2 (content).
+    const paint = context.register(
+      context.stream(`q ${placed.w} 0 0 ${placed.h} 0 0 cm /Sig0 Do Q`, {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, placed.w, placed.h],
+        Resources: { XObject: { Sig0: image.ref } },
+      }),
+    )
+    const blank = context.register(
+      context.stream('% DSBlank', {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, 100, 100],
+        Resources: {},
+      }),
+    )
+    const layers = context.register(
+      context.stream('q 1 0 0 1 0 0 cm /n0 Do Q q 1 0 0 1 0 0 cm /n2 Do Q', {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, placed.w, placed.h],
+        Resources: { XObject: { n0: blank, n2: paint } },
+      }),
+    )
+    appearanceRef = context.register(
+      context.stream('/FRM Do', {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, placed.w, placed.h],
+        // Only a rotated page needs the matrix; the identity is left out like Acrobat does
+        ...(rotation === 0 ? {} : { Matrix: [cos, sin, -sin, cos, 0, 0] }),
+        Resources: { XObject: { FRM: layers } },
+      }),
+    )
   }
 
   // Fresh objects created above (image, appearance) are everything past `firstNew`; the two
@@ -544,7 +581,15 @@ async function assemble(
   const info = context.trailerInfo.Info
   if (info instanceof PDFRef) trailer.set('Info', `${info.objectNumber} ${info.generationNumber} R`)
   const id = context.trailerInfo.ID
-  if (id instanceof PDFArray) trailer.set('ID', id.toString())
+  if (id instanceof PDFArray) {
+    // Re-emit the identifier bytes as they are; a string's text form would re-encode binary IDs
+    const parts = id.asArray().map((entry) => {
+      if (!(entry instanceof PDFString) && !(entry instanceof PDFHexString)) return null
+      return `<${Buffer.from(entry.asBytes()).toString('hex').toUpperCase()}>`
+    })
+    if (parts.length > 0 && parts.every((part) => part !== null))
+      trailer.set('ID', `[ ${parts.join(' ')} ]`)
+  }
   trailer.set('Prev', String(previous.offset))
 
   const xrefOffset = length
