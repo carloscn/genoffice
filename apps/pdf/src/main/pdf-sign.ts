@@ -31,6 +31,22 @@ export interface LoadedCertificate {
   chain: forge.pki.Certificate[]
 }
 
+/**
+ * A signer whose private key never leaves the operating system (Windows CNG/CryptoAPI): the
+ * library hands it the digest to sign and gets the PKCS#1 v1.5 RSA signature back.
+ */
+export interface ExternalSigner {
+  /** DER certificates, signer first */
+  chainDer: Uint8Array[]
+  /** `digest` is the SHA-256 of the signed attributes */
+  signDigest(digest: Uint8Array): Promise<Uint8Array>
+}
+
+export interface ExternalCertificate {
+  certificate: forge.pki.Certificate
+  chain: forge.pki.Certificate[]
+}
+
 const toX509 = (cert: forge.pki.Certificate): X509Certificate =>
   new X509Certificate(
     Buffer.from(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes(), 'binary'),
@@ -118,6 +134,32 @@ export function openCertificate(
   }
 }
 
+/** Parse the certificates an external signer reports; only RSA signer keys are supported */
+export function openExternalCertificate(
+  signer: ExternalSigner,
+):
+  | { ok: true; loaded: ExternalCertificate; info: CertificateInfo[] }
+  | { ok: false; error: CertificateErrorCode } {
+  try {
+    const chain = signer.chainDer.map((der) =>
+      forge.pki.certificateFromAsn1(
+        forge.asn1.fromDer(forge.util.createBuffer(Buffer.from(der).toString('binary'))),
+      ),
+    )
+    const certificate = chain[0]
+    if (!certificate) return { ok: false, error: 'cert-invalid' }
+    if (!(certificate.publicKey as forge.pki.rsa.PublicKey).n)
+      return { ok: false, error: 'cert-unsupported-key' }
+    return {
+      ok: true,
+      loaded: { certificate, chain },
+      info: chain.map((cert) => describeCertificate(toX509(cert))),
+    }
+  } catch {
+    return { ok: false, error: 'cert-invalid' }
+  }
+}
+
 export function inspectCertificate(
   p12: Uint8Array,
   password: string,
@@ -140,8 +182,10 @@ export interface VisibleSignature {
 export interface SignPdfOptions {
   /** Already decrypted by openCertificate; skips decrypting p12 again */
   loaded?: LoadedCertificate
-  p12: Uint8Array
-  password: string
+  p12?: Uint8Array
+  password?: string
+  /** Sign through the OS key store instead of a PKCS#12 (the key is never read) */
+  external?: { signer: ExternalSigner; loaded: ExternalCertificate }
   /** Lower-case SHA-1 of the signer certificate when the bundle holds several identities */
   signerSha1?: string
   reason?: string
@@ -527,24 +571,48 @@ async function assemble(
 }
 
 /** Detached CMS over the two signed ranges; returns the DER bytes */
-function createSignature(data: Buffer, loaded: LoadedCertificate, signingTime: Date): Buffer {
-  const p7 = forge.pkcs7.createSignedData()
-  p7.content = forge.util.createBuffer(data.toString('binary'))
-  for (const cert of loaded.chain) p7.addCertificate(cert)
-  p7.addSigner({
-    key: loaded.privateKey,
-    certificate: loaded.certificate,
-    digestAlgorithm: forge.pki.oids.sha256,
-    authenticatedAttributes: [
-      { type: forge.pki.oids.contentType, value: forge.pki.oids.data },
-      { type: forge.pki.oids.messageDigest },
-      { type: forge.pki.oids.signingTime, value: signingTime as unknown as string },
-    ],
-  })
-  p7.sign({ detached: true })
-  const asn1 = p7.toAsn1()
-  restoreSignerIssuer(asn1, loaded.certificate)
-  return Buffer.from(forge.asn1.toDer(asn1).getBytes(), 'binary')
+async function createSignature(
+  data: Buffer,
+  loaded: ExternalCertificate & { privateKey?: forge.pki.rsa.PrivateKey },
+  signingTime: Date,
+  external?: ExternalSigner,
+): Promise<Buffer> {
+  // forge signs synchronously but an OS signer is async: a first pass records the digest forge
+  // wants signed (the attribute set is deterministic), the OS signs it, and a second pass
+  // replays that signature into the same structure.
+  const recorded: { digest?: Uint8Array; signature?: Uint8Array } = {}
+  const key = external
+    ? {
+        sign: (md: forge.md.MessageDigest): string => {
+          recorded.digest = Buffer.from(md.digest().getBytes(), 'binary')
+          return Buffer.from(recorded.signature ?? new Uint8Array(0)).toString('binary')
+        },
+      }
+    : loaded.privateKey!
+  const build = (): Buffer => {
+    const p7 = forge.pkcs7.createSignedData()
+    p7.content = forge.util.createBuffer(data.toString('binary'))
+    for (const cert of loaded.chain) p7.addCertificate(cert)
+    p7.addSigner({
+      key: key as forge.pki.rsa.PrivateKey,
+      certificate: loaded.certificate,
+      digestAlgorithm: forge.pki.oids.sha256,
+      authenticatedAttributes: [
+        { type: forge.pki.oids.contentType, value: forge.pki.oids.data },
+        { type: forge.pki.oids.messageDigest },
+        { type: forge.pki.oids.signingTime, value: signingTime as unknown as string },
+      ],
+    })
+    p7.sign({ detached: true })
+    const asn1 = p7.toAsn1()
+    restoreSignerIssuer(asn1, loaded.certificate)
+    return Buffer.from(forge.asn1.toDer(asn1).getBytes(), 'binary')
+  }
+  if (!external) return build()
+  build()
+  if (!recorded.digest) throw new SignError('sign-failed')
+  recorded.signature = await external.signDigest(recorded.digest)
+  return build()
 }
 
 /**
@@ -571,8 +639,10 @@ function restoreSignerIssuer(root: forge.asn1.Asn1, cert: forge.pki.Certificate)
 /** Sign `bytes` with a PKCS#12 certificate; the result is the original bytes plus one signature revision */
 export async function signPdf(bytes: Uint8Array, options: SignPdfOptions): Promise<Uint8Array> {
   if (bytes.byteLength > MAX_SIGNABLE_BYTES) throw new SignError('sign-failed')
-  const loaded =
-    options.loaded ?? loadCertificate(options.p12, options.password, options.signerSha1)
+  const loaded: ExternalCertificate & { privateKey?: forge.pki.rsa.PrivateKey } =
+    options.external?.loaded ??
+    options.loaded ??
+    loadCertificate(options.p12 ?? new Uint8Array(), options.password ?? '', options.signerSha1)
   const original = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const signingTime = options.signingTime ?? new Date()
   const withTime = { ...options, signingTime }
@@ -587,7 +657,7 @@ export async function signPdf(bytes: Uint8Array, options: SignPdfOptions): Promi
     const rangeText = `[${range[0]} ${String(range[1]).padStart(BYTE_RANGE_DIGITS, '0')} ${String(range[2]).padStart(BYTE_RANGE_DIGITS, '0')} ${String(range[3]).padStart(BYTE_RANGE_DIGITS, '0')}]`
     file.write(rangeText, byteRangeAt, 'latin1')
     const signed = Buffer.concat([file.subarray(0, contentsStart), file.subarray(contentsEnd)])
-    const cms = createSignature(signed, loaded, signingTime)
+    const cms = await createSignature(signed, loaded, signingTime, options.external?.signer)
     if (cms.length > placeholderBytes) continue
     file.write(cms.toString('hex').toUpperCase(), contentsStart + 1, 'latin1')
     return file
